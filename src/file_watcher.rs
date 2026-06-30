@@ -70,9 +70,12 @@ impl FileWatcher {
     fn run(&mut self) -> Result<(), RecvError> {
         let (watch_sender, watch_receiver) = unbounded::<()>();
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            let event = res.unwrap();
-            if let notify::EventKind::Modify(ModifyKind::Data(_)) = event.kind {
-                watch_sender.send(()).unwrap();
+            // Ignore errors from notify (e.g. inotify queue overflow) — skip the event.
+            if let Ok(event) = res {
+                if let notify::EventKind::Modify(ModifyKind::Data(_)) = event.kind {
+                    // If the receiver is gone (tear-down in progress), silently ignore.
+                    let _ = watch_sender.send(());
+                }
             }
         })
         .unwrap();
@@ -88,8 +91,10 @@ impl FileWatcher {
                             (_watch_sender, _watch_receiver) = unbounded::<()>();
 
                             if self.watching {
-                                let p = self.file_path.as_ref().expect("Inconsistent state");
-                                watcher.unwatch(p).unwrap_or_else(|_| panic!("Failed to unwatch {:?}", p));
+                                if let Some(p) = self.file_path.as_ref() {
+                                    // Unwatching a path that has already been removed is harmless.
+                                    let _ = watcher.unwatch(p);
+                                }
                             }
                             self.file_path = None;
                             self.watching = false;
@@ -105,23 +110,33 @@ impl FileWatcher {
 
                                 self.watching = watcher.watch(Path::new(&p), RecursiveMode::NonRecursive).is_ok();
                             } else {
-                                _content_sender.send(Ok("".to_string())).unwrap();
+                                // Best-effort: receiver may already be dropped during shutdown.
+                                let _ = _content_sender.send(Ok("".to_string()));
                             }
                         }
                     }
                 }
-                recv(watch_receiver) -> _ => { _watch_sender.send(()).unwrap(); }
+                recv(watch_receiver) -> _ => {
+                    // Best-effort: if the FileReader is gone, just ignore.
+                    let _ = _watch_sender.send(());
+                }
                 recv(_content_receiver) -> msg => {
-                    let res = msg.unwrap();
-                    // If we don't have a file watch yet but the file now reads OK, try enabling watch
-                    if !self.watching {
-                        if let (Ok(_), Some(p)) = (&res, &self.file_path) {
-                            self.watching = watcher.watch(Path::new(p), RecursiveMode::NonRecursive).is_ok();
+                    // msg is Err only when the sender (FileReader) has exited — skip.
+                    if let Ok(res) = msg {
+                        // If we don't have a file watch yet but the file now reads OK, try enabling watch
+                        if !self.watching {
+                            if let (Ok(_), Some(p)) = (&res, &self.file_path) {
+                                self.watching = watcher.watch(Path::new(p), RecursiveMode::NonRecursive).is_ok();
+                            }
+                        }
+                        // If the app receiver is gone (app shutting down), exit cleanly.
+                        if self.app
+                            .send(AppMessage::JobOutput(res.map_err(FileWatcherError::File)))
+                            .is_err()
+                        {
+                            return Ok(());
                         }
                     }
-                    self.app
-                        .send(AppMessage::JobOutput(res.map_err(FileWatcherError::File)))
-                        .unwrap();
                 }
             }
         }
