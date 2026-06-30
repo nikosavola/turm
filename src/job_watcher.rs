@@ -1,8 +1,12 @@
 use std::path::PathBuf;
+use std::sync::LazyLock;
 use std::{io::BufRead, process::Command, thread, time::Duration};
 
 use crossbeam::channel::Sender;
 use regex::Regex;
+
+static RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"%(%|A|a|J|j|N|n|s|t|u|x)").unwrap());
 
 use crate::app::AppMessage;
 use crate::app::Job;
@@ -154,10 +158,6 @@ impl JobWatcher {
         working_dir: &str,
     ) -> Option<PathBuf> {
         // see https://slurm.schedmd.com/sbatch.html#SECTION_%3CB%3Efilename-pattern%3C/B%3E
-        lazy_static::lazy_static! {
-            static ref RE: Regex = Regex::new(r"%(%|A|a|J|j|N|n|s|t|u|x)").unwrap();
-        }
-
         let mut path = path.to_owned();
         let slurm_no_val = "4294967294";
         let array_id = if array_id == "N/A" {
