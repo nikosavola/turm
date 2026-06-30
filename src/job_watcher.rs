@@ -24,7 +24,7 @@ impl JobWatcher {
         }
     }
 
-    fn run(&mut self) -> Self {
+    fn run(&mut self) {
         let output_separator = "###turm###";
         let fields = [
             "jobid",
@@ -52,92 +52,117 @@ impl JobWatcher {
             .join(",");
 
         loop {
-            let jobs: Vec<Job> = Command::new("squeue")
+            let output = Command::new("squeue")
                 .args(&self.squeue_args)
                 .arg("--array")
                 .arg("--noheader")
                 .arg("--Format")
                 .arg(&output_format)
-                .output()
-                .expect("failed to execute process")
-                .stdout
-                .lines()
-                .map(|l| l.unwrap().trim().to_string())
-                .filter_map(|l| {
-                    let parts: Vec<_> = l.split(output_separator).collect();
+                .output();
 
-                    if parts.len() != fields.len() + 1 {
-                        return None;
-                    }
+            let msg = match output {
+                Err(e) => AppMessage::JobsError(format!("failed to spawn squeue: {e}")),
+                Ok(output) if !output.status.success() => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stderr = stderr.trim();
+                    let code = output
+                        .status
+                        .code()
+                        .map_or_else(|| "N/A".to_string(), |c| c.to_string());
+                    let detail = if stderr.is_empty() {
+                        format!("squeue exited with code {code}")
+                    } else {
+                        format!("squeue exited with code {code}: {stderr}")
+                    };
+                    AppMessage::JobsError(detail)
+                }
+                Ok(output) => {
+                    let jobs: Vec<Job> = output
+                        .stdout
+                        .lines()
+                        .map(|l| l.unwrap().trim().to_string())
+                        .filter_map(|l| {
+                            let parts: Vec<_> = l.split(output_separator).collect();
 
-                    let id = parts[0];
-                    let name = parts[1];
-                    let state = parts[2];
-                    let user = parts[3];
-                    let time = parts[4];
-                    let time_limit = parts[5];
-                    let start_time = parts[6];
-                    let tres = parts[7];
-                    let partition = parts[8];
-                    let nodelist = parts[9];
-                    let stdout = parts[10];
-                    let stderr = parts[11];
-                    let command = parts[12];
-                    let state_compact = parts[13];
-                    let reason = parts[14];
+                            if parts.len() != fields.len() + 1 {
+                                return None;
+                            }
 
-                    let array_job_id = parts[15];
-                    let array_task_id = parts[16];
-                    let node_list = parts[17];
-                    let working_dir = parts[18];
+                            let id = parts[0];
+                            let name = parts[1];
+                            let state = parts[2];
+                            let user = parts[3];
+                            let time = parts[4];
+                            let time_limit = parts[5];
+                            let start_time = parts[6];
+                            let tres = parts[7];
+                            let partition = parts[8];
+                            let nodelist = parts[9];
+                            let stdout = parts[10];
+                            let stderr = parts[11];
+                            let command = parts[12];
+                            let state_compact = parts[13];
+                            let reason = parts[14];
 
-                    Some(Job {
-                        job_id: id.to_owned(),
-                        array_id: array_job_id.to_owned(),
-                        array_step: match array_task_id {
-                            "N/A" => None,
-                            _ => Some(array_task_id.to_owned()),
-                        },
-                        name: name.to_owned(),
-                        state: state.to_owned(),
-                        state_compact: state_compact.to_owned(),
-                        reason: if reason == "None" {
-                            None
-                        } else {
-                            Some(reason.to_owned())
-                        },
-                        user: user.to_owned(),
-                        time: time.to_owned(),
-                        time_limit: time_limit.to_owned(),
-                        start_time: start_time.to_owned(),
-                        tres: tres.to_owned(),
-                        partition: partition.to_owned(),
-                        nodelist: nodelist.to_owned(),
-                        command: command.to_owned(),
-                        stdout: Self::resolve_path(
-                            stdout,
-                            array_job_id,
-                            array_task_id,
-                            id,
-                            node_list,
-                            user,
-                            name,
-                            working_dir,
-                        ),
-                        stderr: Self::resolve_path(
-                            stderr,
-                            array_job_id,
-                            array_task_id,
-                            id,
-                            node_list,
-                            user,
-                            name,
-                            working_dir,
-                        ), // TODO fill all fields
-                    })
-                })
-                .collect();
-            self.app.send(AppMessage::Jobs(jobs)).unwrap();
+                            let array_job_id = parts[15];
+                            let array_task_id = parts[16];
+                            let node_list = parts[17];
+                            let working_dir = parts[18];
+
+                            Some(Job {
+                                job_id: id.to_owned(),
+                                array_id: array_job_id.to_owned(),
+                                array_step: match array_task_id {
+                                    "N/A" => None,
+                                    _ => Some(array_task_id.to_owned()),
+                                },
+                                name: name.to_owned(),
+                                state: state.to_owned(),
+                                state_compact: state_compact.to_owned(),
+                                reason: if reason == "None" {
+                                    None
+                                } else {
+                                    Some(reason.to_owned())
+                                },
+                                user: user.to_owned(),
+                                time: time.to_owned(),
+                                time_limit: time_limit.to_owned(),
+                                start_time: start_time.to_owned(),
+                                tres: tres.to_owned(),
+                                partition: partition.to_owned(),
+                                nodelist: nodelist.to_owned(),
+                                command: command.to_owned(),
+                                stdout: Self::resolve_path(
+                                    stdout,
+                                    array_job_id,
+                                    array_task_id,
+                                    id,
+                                    node_list,
+                                    user,
+                                    name,
+                                    working_dir,
+                                ),
+                                stderr: Self::resolve_path(
+                                    stderr,
+                                    array_job_id,
+                                    array_task_id,
+                                    id,
+                                    node_list,
+                                    user,
+                                    name,
+                                    working_dir,
+                                ), // TODO fill all fields
+                            })
+                        })
+                        .collect();
+                    AppMessage::Jobs(jobs)
+                }
+            };
+
+            if self.app.send(msg).is_err() {
+                // App has exited; stop the watcher thread cleanly.
+                return;
+            }
             thread::sleep(self.interval);
         }
     }

@@ -53,6 +53,7 @@ pub struct App {
     focus: Focus,
     dialog: Option<Dialog>,
     jobs: Vec<Job>,
+    squeue_error: Option<String>,
     job_list_state: ListState,
     job_output: Result<String, FileWatcherError>,
     job_output_anchor: ScrollAnchor,
@@ -101,6 +102,7 @@ impl Job {
 
 pub enum AppMessage {
     Jobs(Vec<Job>),
+    JobsError(String),
     JobOutput(Result<String, FileWatcherError>),
     Key(KeyEvent),
     MouseClick(usize),
@@ -138,6 +140,7 @@ impl App {
             focus: Focus::Jobs,
             dialog: None,
             jobs: Vec::new(),
+            squeue_error: None,
             _job_watcher: JobWatcherHandle::new(
                 sender.clone(),
                 Duration::from_secs(slurm_refresh_rate),
@@ -287,6 +290,7 @@ impl App {
                 let old_index = self.job_list_state.selected();
                 let old_id = old_index.and_then(|i| self.jobs.get(i)).map(|j| j.id());
 
+                self.squeue_error = None;
                 self.jobs = jobs;
 
                 if self.jobs.is_empty() {
@@ -301,6 +305,11 @@ impl App {
                 } else {
                     self.job_list_state.select_first();
                 }
+            }
+            AppMessage::JobsError(error) => {
+                self.squeue_error = Some(error);
+                self.jobs.clear();
+                self.job_list_state.select(None);
             }
             AppMessage::JobOutput(content) => self.job_output = content,
             AppMessage::Key(key) => {
@@ -625,10 +634,21 @@ impl App {
                 ]))
             })
             .collect();
+        let jobs_title = if let Some(ref err) = self.squeue_error {
+            Line::from(vec![
+                Span::raw("─Jobs "),
+                Span::styled(
+                    format!("squeue error: {err}"),
+                    Style::default().fg(Color::Red),
+                ),
+            ])
+        } else {
+            Line::from(format!("─Jobs ({})", self.jobs.len()))
+        };
         let job_list = List::new(jobs)
             .block(
                 Block::default()
-                    .title(format!("─Jobs ({})", self.jobs.len()))
+                    .title(jobs_title)
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .border_style(if self.dialog.is_some() {
