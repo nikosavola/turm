@@ -21,3 +21,8 @@ notify = "8.0.0"
 ratatui = "0.30.0"
 regex = "1.11.1"
 tui-input = { version = "0.14.0", default-features = false, features = ["crossterm"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
