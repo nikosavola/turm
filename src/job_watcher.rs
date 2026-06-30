@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::{io::BufRead, process::Command, thread, time::Duration};
+use std::{process::Command, thread, time::Duration};
 
 use crossbeam::channel::Sender;
 use regex::Regex;
@@ -52,18 +52,22 @@ impl JobWatcher {
             .join(",");
 
         loop {
-            let jobs: Vec<Job> = Command::new("squeue")
-                .args(&self.squeue_args)
-                .arg("--array")
-                .arg("--noheader")
-                .arg("--Format")
-                .arg(&output_format)
-                .output()
-                .expect("failed to execute process")
-                .stdout
-                .lines()
-                .map(|l| l.unwrap().trim().to_string())
-                .filter_map(|l| {
+            let jobs: Vec<Job> = {
+                let raw_stdout = Command::new("squeue")
+                    .args(&self.squeue_args)
+                    .arg("--array")
+                    .arg("--noheader")
+                    .arg("--Format")
+                    .arg(&output_format)
+                    .output()
+                    .expect("failed to execute process")
+                    .stdout;
+                // Decode lossily so non-UTF-8 bytes become U+FFFD rather than a panic.
+                String::from_utf8_lossy(&raw_stdout).into_owned()
+            }
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter_map(|l| {
                     let parts: Vec<_> = l.split(output_separator).collect();
 
                     if parts.len() != fields.len() + 1 {

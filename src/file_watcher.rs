@@ -22,6 +22,9 @@ struct FileReader {
     interval: Duration,
     content: String,
     pos: u64,
+    /// Bytes of an incomplete multi-byte UTF-8 sequence carried over from the previous read.
+    /// At most 3 bytes (a valid UTF-8 sequence is at most 4 bytes long).
+    pending: Vec<u8>,
 }
 
 struct FileWatcher {
@@ -142,6 +145,7 @@ impl FileReader {
             interval,
             content: "".to_string(),
             pos: 0,
+            pending: Vec::new(),
         }
     }
 
@@ -160,13 +164,61 @@ impl FileReader {
 
     fn update(&mut self) -> Result<(), SendError<io::Result<String>>> {
         let s = File::open(&self.file_path).and_then(|mut f| {
-            // avoid reading the whole file every time
-            self.pos = f.seek(io::SeekFrom::Start(self.pos))?;
-            self.pos += f.read_to_string(&mut self.content)? as u64;
+            // Seek to the current position; avoid re-reading the whole file every tick.
+            f.seek(io::SeekFrom::Start(self.pos))?;
+
+            // Read raw bytes so invalid UTF-8 never causes an error here.
+            let mut raw = Vec::new();
+            let bytes_read = f.read_to_end(&mut raw)? as u64;
+            self.pos += bytes_read;
+
+            if bytes_read == 0 {
+                return Ok(self.content.clone());
+            }
+
+            // Prepend any bytes left over from the previous read (an incomplete
+            // multi-byte sequence that was split across a read boundary).
+            if !self.pending.is_empty() {
+                raw.splice(0..0, self.pending.drain(..));
+            }
+
+            let decoded = decode_utf8_incremental(&raw, &mut self.pending);
+            self.content.push_str(&decoded);
             Ok(self.content.clone())
         });
         // let s = fs::read_to_string(&self.file_path); // alternative: always read the whole file
         self.content_sender.send(s)
+    }
+}
+
+/// Decode `raw` bytes as UTF-8, carrying any trailing incomplete multi-byte
+/// sequence into `pending` for the next call.  Bytes that are genuinely
+/// invalid UTF-8 (not merely truncated) are replaced with U+FFFD so the
+/// caller never sees an error.
+///
+/// On entry `pending` must be empty (the caller has already prepended its
+/// contents to `raw`).  On return `pending` contains at most 3 bytes.
+fn decode_utf8_incremental(raw: &[u8], pending: &mut Vec<u8>) -> String {
+    // Find the largest valid UTF-8 prefix.
+    let valid_up_to = match std::str::from_utf8(raw) {
+        Ok(_) => raw.len(),
+        Err(e) => e.valid_up_to(),
+    };
+
+    // Everything after `valid_up_to` is either the start of a multi-byte
+    // sequence that was truncated at the read boundary, or genuinely invalid
+    // bytes.  A valid UTF-8 sequence is at most 4 bytes long, so fewer than 4
+    // leftover bytes can still be a legitimate incomplete sequence.  4 or more
+    // leftover bytes can never form a single sequence → replace them lossily.
+    let remainder = &raw[valid_up_to..];
+    if remainder.len() < 4 {
+        // Might be an incomplete sequence; stash for the next read.
+        pending.extend_from_slice(remainder);
+        // SAFETY: we verified `raw[..valid_up_to]` is valid UTF-8 above.
+        unsafe { std::str::from_utf8_unchecked(&raw[..valid_up_to]) }.to_owned()
+    } else {
+        // Genuinely undecodable bytes: emit replacement characters and move on.
+        String::from_utf8_lossy(raw).into_owned()
     }
 }
 
@@ -189,5 +241,53 @@ impl FileWatcherHandle {
                 .send(FileWatcherMessage::FilePath(file_path))
                 .unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Split a multibyte character (U+00E9 LATIN SMALL LETTER E WITH ACUTE,
+    /// encoded as 0xC3 0xA9) across two reads and verify that both chunks
+    /// together produce the correct string with no replacement characters.
+    #[test]
+    fn test_incremental_utf8_split_multibyte() {
+        // U+00E9 = 0xC3 0xA9 (two-byte sequence).
+        // Simulate first read: valid ASCII + first byte of the sequence.
+        let first_chunk = b"hello \xC3";
+        let mut pending = Vec::new();
+
+        let decoded1 = decode_utf8_incremental(first_chunk, &mut pending);
+        assert_eq!(decoded1, "hello ");
+        // The incomplete byte must be stashed.
+        assert_eq!(pending, vec![0xC3]);
+
+        // Simulate second read: prepend pending, then append the rest.
+        let second_raw_from_file = b"\xA9 world";
+        let mut second_chunk = pending.clone();
+        second_chunk.extend_from_slice(second_raw_from_file);
+        pending.clear();
+
+        let decoded2 = decode_utf8_incremental(&second_chunk, &mut pending);
+        assert_eq!(decoded2, "\u{00E9} world");
+        assert!(pending.is_empty());
+
+        // Together the two decoded pieces equal the original string.
+        assert_eq!(decoded1 + &decoded2, "hello \u{00E9} world");
+    }
+
+    /// Genuinely invalid UTF-8 bytes (not a truncated sequence) are replaced
+    /// with U+FFFD replacement characters rather than returning an error.
+    #[test]
+    fn test_incremental_utf8_invalid_bytes() {
+        // 0xFF is never valid in UTF-8.
+        let raw = b"abc\xFF\xFEdef";
+        let mut pending = Vec::new();
+        let decoded = decode_utf8_incremental(raw, &mut pending);
+        // The output must contain no panic and must contain the replacement char.
+        assert!(decoded.contains('\u{FFFD}'));
+        assert!(decoded.contains("abc"));
+        assert!(decoded.contains("def"));
     }
 }
