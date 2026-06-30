@@ -160,6 +160,13 @@ impl FileReader {
 
     fn update(&mut self) -> Result<(), SendError<io::Result<String>>> {
         let s = File::open(&self.file_path).and_then(|mut f| {
+            // Detect truncation/rotation: if the file is now shorter than our
+            // stored position the log was overwritten; restart from the beginning.
+            let file_len = f.seek(io::SeekFrom::End(0))?;
+            if file_len < self.pos {
+                self.pos = 0;
+                self.content.clear();
+            }
             // avoid reading the whole file every time
             self.pos = f.seek(io::SeekFrom::Start(self.pos))?;
             self.pos += f.read_to_string(&mut self.content)? as u64;
@@ -189,5 +196,56 @@ impl FileWatcherHandle {
                 .send(FileWatcherMessage::FilePath(file_path))
                 .unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn make_reader(path: PathBuf) -> (FileReader, crossbeam::channel::Receiver<io::Result<String>>) {
+        let (content_sender, content_receiver) = crossbeam::channel::unbounded();
+        let (_trigger_sender, trigger_receiver) = crossbeam::channel::unbounded::<()>();
+        let reader = FileReader::new(content_sender, trigger_receiver, path, Duration::from_secs(1));
+        (reader, content_receiver)
+    }
+
+    #[test]
+    fn test_truncation_resets_position() {
+        let mut tmp = std::env::temp_dir();
+        tmp.push(format!("turm_test_{}.log", std::process::id()));
+
+        // Write initial content and read it
+        {
+            let mut f = File::create(&tmp).unwrap();
+            f.write_all(b"first line\n").unwrap();
+        }
+        let (mut reader, rx) = make_reader(tmp.clone());
+        reader.update().unwrap();
+        let content = rx.recv().unwrap().unwrap();
+        assert!(content.contains("first line"), "initial read should contain first line");
+        assert!(reader.pos > 0, "pos should be non-zero after first read");
+
+        // Append more content (normal case) and read
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&tmp).unwrap();
+            f.write_all(b"second line\n").unwrap();
+        }
+        reader.update().unwrap();
+        let content = rx.recv().unwrap().unwrap();
+        assert!(content.contains("second line"), "incremental read should contain second line");
+
+        // Truncate the file (simulate rotation / job re-run)
+        {
+            let mut f = File::create(&tmp).unwrap();
+            f.write_all(b"new\n").unwrap();
+        }
+        reader.update().unwrap();
+        let content = rx.recv().unwrap().unwrap();
+        assert_eq!(content, "new\n", "after truncation content should reset to new file contents");
+        assert_eq!(reader.pos, 4, "pos should reflect only the new content");
+
+        std::fs::remove_file(&tmp).ok();
     }
 }
