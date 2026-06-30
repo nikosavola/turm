@@ -20,10 +20,6 @@ use ratatui::{
 use std::io;
 use tui_input::{Input, backend::crossterm::EventHandler};
 
-pub enum Focus {
-    Jobs,
-}
-
 pub enum Dialog {
     ConfirmCancelJob(String),
     SelectCancelSignal { id: String, selected_signal: usize },
@@ -50,7 +46,6 @@ pub enum OutputFileView {
 }
 
 pub struct App {
-    focus: Focus,
     dialog: Option<Dialog>,
     jobs: Vec<Job>,
     job_list_state: ListState,
@@ -135,7 +130,6 @@ impl App {
     ) -> App {
         let (sender, receiver) = unbounded();
         Self {
-            focus: Focus::Jobs,
             dialog: None,
             jobs: Vec::new(),
             _job_watcher: JobWatcherHandle::new(
@@ -386,40 +380,26 @@ impl App {
                     }
                 } else {
                     match key.code {
-                        KeyCode::Char('h') | KeyCode::Left => self.focus_previous_panel(),
-                        KeyCode::Char('l') | KeyCode::Right => self.focus_next_panel(),
-                        KeyCode::Char('k') | KeyCode::Up => match self.focus {
-                            Focus::Jobs => self.select_previous_job(),
-                        },
-                        KeyCode::Char('j') | KeyCode::Down => match self.focus {
-                            Focus::Jobs => self.select_next_job(),
-                        },
-                        KeyCode::Char('g') => match self.focus {
-                            Focus::Jobs => self.select_first_job(),
-                        },
-                        KeyCode::Char('G') => match self.focus {
-                            Focus::Jobs => self.select_last_job(),
-                        },
-                        KeyCode::Char('u') => match self.focus {
-                            Focus::Jobs => {
-                                if key
-                                    .modifiers
-                                    .contains(crossterm::event::KeyModifiers::CONTROL)
-                                {
-                                    self.scroll_jobs_half_page_up()
-                                }
+                        KeyCode::Char('k') | KeyCode::Up => self.select_previous_job(),
+                        KeyCode::Char('j') | KeyCode::Down => self.select_next_job(),
+                        KeyCode::Char('g') => self.select_first_job(),
+                        KeyCode::Char('G') => self.select_last_job(),
+                        KeyCode::Char('u') => {
+                            if key
+                                .modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL)
+                            {
+                                self.scroll_jobs_half_page_up()
                             }
-                        },
-                        KeyCode::Char('d') => match self.focus {
-                            Focus::Jobs => {
-                                if key
-                                    .modifiers
-                                    .contains(crossterm::event::KeyModifiers::CONTROL)
-                                {
-                                    self.scroll_jobs_half_page_down()
-                                }
+                        }
+                        KeyCode::Char('d') => {
+                            if key
+                                .modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL)
+                            {
+                                self.scroll_jobs_half_page_down()
                             }
-                        },
+                        }
                         KeyCode::PageDown => {
                             let delta = if key.modifiers.intersects(
                                 crossterm::event::KeyModifiers::SHIFT
@@ -634,9 +614,7 @@ impl App {
                     .border_style(if self.dialog.is_some() {
                         Style::default()
                     } else {
-                        match self.focus {
-                            Focus::Jobs => Style::default().fg(Color::Green),
-                        }
+                        Style::default().fg(Color::Green)
                     }),
             )
             .highlight_style(Style::default().bg(Color::Green).fg(Color::Black));
@@ -1015,18 +993,6 @@ impl App {
 
     fn selected_job_id(&self) -> Option<String> {
         self.selected_job().map(Job::id)
-    }
-
-    fn focus_next_panel(&mut self) {
-        match self.focus {
-            Focus::Jobs => self.focus = Focus::Jobs,
-        }
-    }
-
-    fn focus_previous_panel(&mut self) {
-        match self.focus {
-            Focus::Jobs => self.focus = Focus::Jobs,
-        }
     }
 
     fn select_next_job(&mut self) {
