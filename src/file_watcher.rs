@@ -22,6 +22,7 @@ struct FileReader {
     interval: Duration,
     content: String,
     pos: u64,
+    first_send: bool,
 }
 
 struct FileWatcher {
@@ -142,6 +143,7 @@ impl FileReader {
             interval,
             content: "".to_string(),
             pos: 0,
+            first_send: true,
         }
     }
 
@@ -159,14 +161,30 @@ impl FileReader {
     }
 
     fn update(&mut self) -> Result<(), SendError<io::Result<String>>> {
-        let s = File::open(&self.file_path).and_then(|mut f| {
+        let result = File::open(&self.file_path).and_then(|mut f| {
             // avoid reading the whole file every time
-            self.pos = f.seek(io::SeekFrom::Start(self.pos))?;
-            self.pos += f.read_to_string(&mut self.content)? as u64;
-            Ok(self.content.clone())
+            let seeked_pos = f.seek(io::SeekFrom::Start(self.pos))?;
+            let new_bytes = f.read_to_string(&mut self.content)? as u64;
+            // Detect truncation: seeked_pos < self.pos means the file shrank
+            let truncated = seeked_pos < self.pos;
+            self.pos = seeked_pos + new_bytes;
+            Ok((new_bytes, truncated))
         });
         // let s = fs::read_to_string(&self.file_path); // alternative: always read the whole file
-        self.content_sender.send(s)
+        match result {
+            Ok((new_bytes, truncated)) => {
+                // Skip sending when nothing changed and this is not the first send
+                if new_bytes == 0 && !truncated && !self.first_send {
+                    return Ok(());
+                }
+                self.first_send = false;
+                self.content_sender.send(Ok(self.content.clone()))
+            }
+            Err(e) => {
+                self.first_send = false;
+                self.content_sender.send(Err(e))
+            }
+        }
     }
 }
 
