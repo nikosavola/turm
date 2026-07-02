@@ -91,13 +91,13 @@ impl JobWatcher {
                     let node_list = parts[17];
                     let working_dir = parts[18];
 
+                    let display_id = match array_task_id {
+                        "N/A" => id.to_owned(),
+                        _ => format!("{array_job_id}_{array_task_id}"),
+                    };
+
                     Some(Job {
-                        job_id: id.to_owned(),
-                        array_id: array_job_id.to_owned(),
-                        array_step: match array_task_id {
-                            "N/A" => None,
-                            _ => Some(array_task_id.to_owned()),
-                        },
+                        id: display_id,
                         name: name.to_owned(),
                         state: state.to_owned(),
                         state_compact: state_compact.to_owned(),

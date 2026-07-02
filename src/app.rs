@@ -53,6 +53,7 @@ pub struct App {
     focus: Focus,
     dialog: Option<Dialog>,
     jobs: Vec<Job>,
+    column_widths: ColumnWidths,
     job_list_state: ListState,
     job_output: Result<String, FileWatcherError>,
     job_output_anchor: ScrollAnchor,
@@ -71,9 +72,10 @@ pub struct App {
 }
 
 pub struct Job {
-    pub job_id: String,
-    pub array_id: String,
-    pub array_step: Option<String>,
+    /// Display id (`{array_id}_{array_step}` for array jobs, otherwise `job_id`),
+    /// precomputed once when the job is built so it doesn't need to be
+    /// reallocated on every render.
+    pub id: String,
     pub name: String,
     pub state: String,
     pub state_compact: String,
@@ -91,11 +93,31 @@ pub struct Job {
 }
 
 impl Job {
-    fn id(&self) -> String {
-        match self.array_step.as_ref() {
-            Some(array_step) => format!("{}_{}", self.array_id, array_step),
-            None => self.job_id.clone(),
-        }
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// Column widths for the job list, computed once whenever the job list is
+/// replaced instead of being rescanned on every frame.
+#[derive(Default, Clone, Copy)]
+struct ColumnWidths {
+    id: usize,
+    user: usize,
+    partition: usize,
+    time: usize,
+    state_compact: usize,
+}
+
+impl ColumnWidths {
+    fn compute(jobs: &[Job]) -> Self {
+        jobs.iter().fold(Self::default(), |acc, j| Self {
+            id: acc.id.max(j.id().len()),
+            user: acc.user.max(j.user.len()),
+            partition: acc.partition.max(j.partition.len()),
+            time: acc.time.max(j.time.len()),
+            state_compact: acc.state_compact.max(j.state_compact.len()),
+        })
     }
 }
 
@@ -138,6 +160,7 @@ impl App {
             focus: Focus::Jobs,
             dialog: None,
             jobs: Vec::new(),
+            column_widths: ColumnWidths::default(),
             _job_watcher: JobWatcherHandle::new(
                 sender.clone(),
                 Duration::from_secs(slurm_refresh_rate),
@@ -285,9 +308,12 @@ impl App {
             AppMessage::Jobs(jobs) => {
                 // On refresh: keep the same job selected if it still exists
                 let old_index = self.job_list_state.selected();
-                let old_id = old_index.and_then(|i| self.jobs.get(i)).map(|j| j.id());
+                let old_id = old_index
+                    .and_then(|i| self.jobs.get(i))
+                    .map(|j| j.id().to_owned());
 
                 self.jobs = jobs;
+                self.column_widths = ColumnWidths::compute(&self.jobs);
 
                 if self.jobs.is_empty() {
                     self.job_list_state.select(None);
@@ -468,7 +494,7 @@ impl App {
                         KeyCode::Char('t') => {
                             if let Some(job) = self.selected_job() {
                                 self.dialog = Some(Dialog::EditTimeLimit {
-                                    id: job.id(),
+                                    id: job.id().to_owned(),
                                     input: Input::new(job.time_limit.clone()),
                                 });
                             }
@@ -572,21 +598,13 @@ impl App {
         f.render_widget(help, content_help[1]);
 
         // Jobs
-        let max_id_len = self.jobs.iter().map(|j| j.id().len()).max().unwrap_or(0);
-        let max_user_len = self.jobs.iter().map(|j| j.user.len()).max().unwrap_or(0);
-        let max_partition_len = self
-            .jobs
-            .iter()
-            .map(|j| j.partition.len())
-            .max()
-            .unwrap_or(0);
-        let max_time_len = self.jobs.iter().map(|j| j.time.len()).max().unwrap_or(0);
-        let max_state_compact_len = self
-            .jobs
-            .iter()
-            .map(|j| j.state_compact.len())
-            .max()
-            .unwrap_or(0);
+        let ColumnWidths {
+            id: max_id_len,
+            user: max_user_len,
+            partition: max_partition_len,
+            time: max_time_len,
+            state_compact: max_state_compact_len,
+        } = self.column_widths;
         let jobs: Vec<ListItem> = self
             .jobs
             .iter()
@@ -1014,7 +1032,7 @@ impl App {
     }
 
     fn selected_job_id(&self) -> Option<String> {
-        self.selected_job().map(Job::id)
+        self.selected_job().map(|j| j.id().to_owned())
     }
 
     fn focus_next_panel(&mut self) {
