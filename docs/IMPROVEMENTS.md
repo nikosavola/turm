@@ -13,6 +13,10 @@ checklist. Issues are ordered by category and priority.
 about latent runtime failures, resource usage, supply-chain/CI hygiene, and
 maintainability — not current compiler/clippy warnings.
 
+> **Update:** a second review pass focused on refactoring and DRY was added
+> below as [Round 2](#round-2--refactoring--dry) (issues 14–21). Round 1
+> (issues 1–13) has been implemented on `claude/*` branches; round 2 has not.
+
 ### Priority summary
 
 | # | Title | Category | Priority |
@@ -473,10 +477,355 @@ no tests. The repo already ships mock Slurm binaries that are unused by CI.
 
 ---
 
-## Out-of-scope / nice-to-have (not filed as issues)
+---
 
-- **Split `app.rs` (1252 lines)** into `ui`, `input`, `dialog`, and `commands`
-  modules for readability — purely organisational.
-- **`SqueueArgs::to_vec`** (`src/squeue_args.rs:86-150`) is repetitive
-  boilerplate; a small macro or struct-driven approach would shrink it, but the
-  explicit form is clear and low-risk.
+# Round 2 — Refactoring & DRY
+
+A second review pass focused on code structure, duplication, and dead weight.
+These are behaviour-preserving changes; none fix bugs. Two items previously
+listed as "out of scope" (`app.rs` split, `SqueueArgs::to_vec`) are promoted to
+full issues here.
+
+**Sequencing note:** issues 14–21 touch the same files as the stability
+branches from round 1 (`fix-*`, `perf-*`, `test-parsing-path-resolution`).
+Land those first, then rebase/implement these on the merged result — doing the
+refactors in parallel would guarantee conflicts.
+
+### Priority summary (round 2)
+
+| # | Title | Category | Priority |
+|---|-------|----------|----------|
+| 14 | Split `app.rs` (1252 lines) into focused modules | Refactoring | Medium |
+| 15 | DRY the dialog rendering in `App::ui` | DRY | Medium |
+| 16 | Table-drive `SqueueArgs::to_vec` flag forwarding | DRY | Low |
+| 17 | Replace positional `parts[i]` parsing with slice destructuring | Refactoring / Safety | Medium |
+| 18 | Simplify `resolve_path`: context struct + `replace_all` (fix TODO) | Refactoring | Medium |
+| 19 | Clarify the file-watcher channel-swap lifecycle | Refactoring | Medium |
+| 20 | Stop recomputing `Job::id()` and column widths every frame | DRY / Performance | Low |
+| 21 | Small DRY cleanups in `app.rs` (detail lines, PageUp/Down, help line) | DRY | Low |
+
+---
+
+## Issue 14 — Split `app.rs` (1252 lines) into focused modules
+
+**Labels:** `refactoring`, `maintainability`, `priority:medium`
+
+### Summary
+`src/app.rs` is 1252 lines and mixes at least five concerns: app state + event
+loop, key/mouse input handling, dialog state machines, widget rendering, text
+layout utilities, and Slurm command execution. Every feature added so far
+(signal picker, time-limit dialog, error dialog) has grown this one file.
+
+### Details
+Current contents of `src/app.rs` by concern:
+- **State & event loop:** `App`, `AppMessage`, `run`, `handle` (~500 lines).
+- **Input:** `handle_input_event`, mouse-wheel merging, `job_index_at`,
+  `mouse_scroll_target` (~150 lines).
+- **Dialogs:** `Dialog` enum, per-dialog key handling inside `handle`, per-dialog
+  rendering inside `ui` (~300 lines across two `match` sites — see Issue 15).
+- **Rendering utilities:** `fit_text`, `chunked_string`, `rect_contains` (~120 lines).
+- **Command execution:** `execute_scancel`, `execute_scontrol_update_timelimit`,
+  `execute_command`, `CommandFailure` (~70 lines).
+
+### Proposed fix
+Extract along the existing seams, no behaviour change:
+- `src/ui/` (or `render.rs`): `ui`, `fit_text`, `chunked_string`, dialog rendering.
+- `src/input.rs`: input-event handling and mouse helpers.
+- `src/dialog.rs`: `Dialog`, its key handling, its rendering.
+- `src/slurm.rs` (or `commands.rs`): `execute_*`, `CommandFailure`.
+- `app.rs` keeps `App`, `Job`, `AppMessage`, `run`, `handle`.
+
+Each extraction is independently landable; do it in 2–3 small PRs rather than
+one big-bang move so blame/history stays useful.
+
+---
+
+## Issue 15 — DRY the dialog rendering in `App::ui`
+
+**Labels:** `refactoring`, `dry`, `priority:medium`
+
+### Summary
+The four dialog arms in `App::ui` (`src/app.rs:782-913`) each repeat the same
+scaffold: build a `Paragraph`, wrap it in a rounded-border `Block` with a
+`─Title`, compute a centered area, `Clear`, render. Only the content, title,
+colour, and height differ.
+
+### Details
+Repeated per arm (4×):
+
+```rust
+let dialog = Paragraph::new(...)
+    .style(Style::default().fg(Color::White))
+    .wrap(Wrap { trim: true })
+    .block(
+        Block::default()
+            .title("─<Title>")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .style(Style::default().fg(Color::Green)), // Red for errors
+    );
+let area = centered_dialog_area(DIALOG_WIDTH, <height>, f.area());
+f.render_widget(Clear, area);
+f.render_widget(dialog, area);
+```
+
+`centered_dialog_area` is already a nested `fn` inside `ui` — a sign the
+abstraction wants to exist but stopped halfway.
+
+### Proposed fix
+- Hoist `centered_dialog_area` out of `ui`.
+- Add one helper, e.g.
+  `render_dialog(f, title: &str, color: Color, height: u16, content: Text)`,
+  and reduce each arm to content construction plus one call. The
+  `EditTimeLimit` arm additionally sets a cursor position; let the helper
+  return the inner `Rect` so that arm can keep its cursor logic.
+- Net effect: ~60–80 lines removed, and the next dialog type costs one arm,
+  not one copy of the scaffold.
+
+---
+
+## Issue 16 — Table-drive `SqueueArgs::to_vec` flag forwarding
+
+**Labels:** `refactoring`, `dry`, `priority:low`
+
+### Summary
+`SqueueArgs::to_vec` (`src/squeue_args.rs:86-150`) is 20 near-identical
+`if`-blocks — one per flag — that must be kept in sync by hand with the 20
+derive-annotated struct fields above them. Adding a squeue flag today means
+editing two places with no compiler help if you forget the second.
+
+### Details
+```rust
+if let Some(account) = &self.account {
+    args.push(format!("--account={}", account));
+}
+if self.all {
+    args.push("--all".to_string());
+}
+// ... 18 more of the same
+```
+
+### Proposed fix
+Keep the derive struct (clap needs it) but collapse `to_vec` into two
+table-driven loops:
+
+```rust
+let value_flags: [(&str, Option<&String>); 12] = [
+    ("account", self.account.as_ref()),
+    ("job", self.job.as_ref()),
+    // ...
+];
+let bool_flags: [(&str, bool); 8] = [
+    ("all", self.all),
+    ("federation", self.federation),
+    // ...
+];
+```
+
+then iterate. This halves the code and puts every flag on one line. (A proc/
+declarative macro could remove the duplication entirely, but is overkill for a
+20-flag CLI; the table keeps it plain Rust.)
+
+---
+
+## Issue 17 — Replace positional `parts[i]` parsing with slice destructuring
+
+**Labels:** `refactoring`, `safety`, `priority:medium`
+
+### Summary
+The `squeue` line parser assigns fields by hard-coded index
+(`src/job_watcher.rs:73-92`): `parts[0]` … `parts[18]`, with only a length
+check guarding them. The indices must stay in lock-step with the `fields`
+array defined 40 lines earlier; a reorder or insertion in one place silently
+scrambles every downstream field (job id becomes user, stdout becomes command,
+…) with no compiler or runtime error.
+
+### Details
+```rust
+let fields = ["jobid", "name", "state", /* ... 16 more ... */];
+// ... later ...
+let id = parts[0];
+let name = parts[1];
+// ...
+let working_dir = parts[18];
+```
+
+The `// TODO fill all fields` comment at `job_watcher.rs:136` marks the same
+area as known-unfinished.
+
+### Proposed fix
+Bind names and arity in a single pattern so the compiler enforces the count:
+
+```rust
+let [id, name, state, user, time, time_limit, start_time, tres, partition,
+     nodelist, stdout, stderr, command, state_compact, reason,
+     array_job_id, array_task_id, node_list, working_dir, _trailing] =
+    parts.as_slice() else { return None; };
+```
+
+One place lists the names, the wrong-arity case falls out naturally, and a
+mismatch with the `fields` array becomes much harder to introduce (keep the
+`fields` array adjacent with a comment tying the two orders together).
+Builds on the `parse_line` extraction from the
+`claude/test-parsing-path-resolution` branch — implement after that lands so
+the new tests pin the behaviour during the refactor.
+
+---
+
+## Issue 18 — Simplify `resolve_path`: parameter struct + single-pass `replace_all`
+
+**Labels:** `refactoring`, `priority:medium`
+
+### Summary
+`resolve_path` (`src/job_watcher.rs:145-207`) carries two smells it already
+apologises for: an 8-parameter signature silenced with
+`#[allow(clippy::too_many_arguments)]`, and a collect-reverse-replace loop
+whose own comment says *"TODO: this is stupid, there has to be a better way to
+reverse the captures..."*.
+
+### Details
+1. Both call sites pass the same 7 context values (only `path` differs):
+   ```rust
+   stdout: Self::resolve_path(stdout, array_job_id, array_task_id, id,
+                              node_list, user, name, working_dir),
+   stderr: Self::resolve_path(stderr, array_job_id, array_task_id, id,
+                              node_list, user, name, working_dir),
+   ```
+2. The manual reverse-iteration + `replace_range` exists only to keep byte
+   ranges valid while mutating the string in place. `Regex::replace_all` with a
+   closure does the same substitution in one forward pass with no index
+   bookkeeping:
+   ```rust
+   let resolved = RE.replace_all(&path, |caps: &Captures| match &caps[0] {
+       "%%" => "%",
+       "%A" => array_master,
+       // ...
+   });
+   ```
+
+### Proposed fix
+- Introduce a small context struct (e.g. `FilenameContext { array_master,
+  array_id, id, host, user, name, working_dir }`) built once per job; give it a
+  `resolve(&self, pattern: &str) -> Option<PathBuf>` method. Both the clippy
+  `allow` and the duplicated argument lists disappear.
+- Replace the reverse loop with `RE.replace_all` + closure, deleting the TODO.
+- The `resolve_path` test table from `claude/test-parsing-path-resolution`
+  pins the semantics — land that branch first, then refactor green-to-green.
+
+---
+
+## Issue 19 — Clarify the file-watcher channel-swap lifecycle
+
+**Labels:** `refactoring`, `maintainability`, `priority:medium`
+
+### Summary
+`FileWatcher::run` (`src/file_watcher.rs:80-113`) manages the lifecycle of the
+per-file `FileReader` thread through an unusual idiom: underscore-prefixed
+*but actively used* channel variables that are re-created and shadowed on every
+`FilePath` message. The mechanism works, but the intent — "orphan the previous
+reader thread so its next send fails and it exits" — is entirely implicit.
+
+### Details
+```rust
+let (mut _content_sender, mut _content_receiver) = unbounded::<io::Result<String>>();
+let (mut _watch_sender, mut _watch_receiver) = unbounded::<()>();
+loop {
+    select! {
+        recv(self.receiver) -> msg => {
+            ...
+            (_content_sender, _content_receiver) = unbounded();
+            (_watch_sender, _watch_receiver) = unbounded::<()>();
+            ...
+        }
+        recv(watch_receiver) -> _ => { _watch_sender.send(()).unwrap(); }
+        recv(_content_receiver) -> msg => { ... }
+    }
+}
+```
+
+Problems:
+- Underscore prefixes conventionally mean "unused"; these are load-bearing.
+- Dropping the old sender/receiver pair is the *only* thing that stops the old
+  `FileReader` thread — nothing in the code says so.
+- Two nearly-identical channel pairs (`watch_receiver` from the notify
+  callback, `_watch_receiver` forwarded to the reader) make the data flow hard
+  to trace.
+
+### Proposed fix
+- Encapsulate the per-file reader in a small owned type, e.g.
+  `struct ActiveReader { content_rx: Receiver<...>, watch_tx: Sender<()> }`
+  stored as `Option<ActiveReader>` on `FileWatcher`; replacing/`take()`-ing it
+  is the explicit stop signal (document that dropping the channels terminates
+  the reader thread).
+- Rename channels for direction and purpose (`notify_tx/notify_rx`,
+  `reader_kick_tx`, `content_rx`), drop the underscore prefixes.
+- No behavioural change; this is purely making the ownership story readable.
+  Coordinate with the round-1 branches that touch this file (#2, #3, #4, #5,
+  #6) — do this refactor after they merge.
+
+---
+
+## Issue 20 — Stop recomputing `Job::id()` and column widths on every frame
+
+**Labels:** `dry`, `performance`, `priority:low`
+
+### Summary
+`Job::id()` allocates a fresh `String` on every call (`src/app.rs:93-100`), and
+`App::ui` calls it (plus five per-column `iter().map().max()` sweeps over all
+jobs, `src/app.rs:575-589`) on **every render** — including renders triggered
+by pure log-output ticks where the job list hasn't changed at all.
+
+### Details
+- `ui` runs on every `AppMessage`, including `JobOutput` messages every
+  `file_refresh` seconds, and every mouse-wheel/key event.
+- Per frame, for N jobs: N `format!` allocations for `id()` in the width scan,
+  another N in the list-item construction, plus 5 full O(N) column scans —
+  all recomputed from unchanged data.
+- `handle(AppMessage::Jobs)` also calls `j.id()` in a `position` scan on each
+  refresh.
+
+With a few hundred queued jobs this is not a bottleneck, but it is pure waste
+with a trivial fix, and `--states=ALL` on a busy cluster can return thousands
+of rows.
+
+### Proposed fix
+- Compute the display id once at `Job` construction (the job watcher has all
+  the inputs) and store it as a field; `id()` becomes a `&str` accessor.
+- Compute the five column widths once in `handle(AppMessage::Jobs(...))` and
+  cache them on `App` (e.g. a `ColumnWidths` struct), invalidated only when the
+  job list changes.
+- Sequence after round-1 branches #1/#13 (both touch `Job` construction).
+
+---
+
+## Issue 21 — Small DRY cleanups in `app.rs`
+
+**Labels:** `dry`, `cleanup`, `priority:low`
+
+### Summary
+Grab-bag of small repetition in `src/app.rs`, batched so they don't generate
+four one-line PRs.
+
+### Details
+1. **Job-detail label lines** (`app.rs:654-711`): six blocks repeat
+   `Span::styled("<Label>  ", yellow) + Span::raw(" ") + Span::raw(value)`.
+   Extract `fn detail_line(label: &str, value: &str) -> Line` (the padded
+   7-char label can be `format!("{:<7}", label)`), keeping the conditional
+   `PENDING`/`reason` extensions as post-processing on the `state` line.
+2. **PageUp/PageDown arms** (`app.rs:423-446`): the two arms are identical
+   except scroll direction — the modifier-to-delta computation is duplicated.
+   Extract `fn page_scroll_delta(modifiers: KeyModifiers) -> u16` (and name the
+   magic `50` as a `const`).
+3. **Help-line separator fold** (`app.rs:558-569`): the manual `fold` that
+   inserts `" | "` separators is a hand-rolled intersperse; `itertools` is
+   already a dependency (`Itertools::intersperse` or building spans with
+   `flat_map` + `skip(1)`), or keep the fold but extract it as a
+   `fn help_line(entries: &[(&str, &str)]) -> Line`.
+4. **`CommandFailure` → `Dialog::CommandError` conversion**: the two types are
+   field-for-field identical and converted by hand at `app.rs:382-384`;
+   implement `From<CommandFailure> for Dialog` to make the relationship
+   explicit.
+
+### Proposed fix
+One PR applying all four; each is mechanical and behaviour-preserving.
+Item 2 composes with round-1 branch #12 (key-handling area) — rebase on it.
