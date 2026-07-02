@@ -2,11 +2,15 @@ use crossbeam::{
     channel::{Receiver, TryRecvError, unbounded},
     select,
 };
-use itertools::Either;
-use std::{cmp::min, iter::once, path::PathBuf, process::Command, time::Duration};
+use std::{cmp::min, path::PathBuf, time::Duration};
 
+use crate::dialog::{
+    Dialog, SCANCEL_SIGNALS, render_dialog, signal_index_for_digit, validated_time_limit,
+};
 use crate::file_watcher::{FileWatcherError, FileWatcherHandle};
 use crate::job_watcher::JobWatcherHandle;
+use crate::slurm::{CommandFailure, execute_scancel, execute_scontrol_update_timelimit};
+use crate::ui_text::fit_text;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, MouseButton, MouseEventKind};
 use ratatui::{
@@ -15,7 +19,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 use std::io;
 use tui_input::{Input, backend::crossterm::EventHandler};
@@ -24,20 +28,8 @@ pub enum Focus {
     Jobs,
 }
 
-pub enum Dialog {
-    ConfirmCancelJob(String),
-    SelectCancelSignal { id: String, selected_signal: usize },
-    EditTimeLimit { id: String, input: Input },
-    CommandError { command: String, output: String },
-}
-
-struct CommandFailure {
-    command: String,
-    output: String,
-}
-
 #[derive(Clone, Copy)]
-pub enum ScrollAnchor {
+pub(crate) enum ScrollAnchor {
     Top,
     Bottom,
 }
@@ -122,9 +114,6 @@ pub(crate) enum MouseScrollTarget {
     Jobs,
     Output,
 }
-
-const SCANCEL_SIGNALS: &[&str] = &["TERM", "INT", "HUP", "USR1", "USR2", "STOP", "CONT", "KILL"];
-const DIALOG_WIDTH: u16 = 80;
 
 impl App {
     pub fn new(
@@ -770,239 +759,8 @@ impl App {
         f.render_widget(log, log_area);
 
         if let Some(dialog) = &self.dialog {
-            fn centered_dialog_area(width: u16, lines: u16, viewport: Rect) -> Rect {
-                let dialog_width = min(width, viewport.width);
-                let dialog_height = min(lines, viewport.height);
-                let dialog_x = viewport.x + viewport.width.saturating_sub(dialog_width) / 2;
-                let dialog_y = viewport.y + viewport.height.saturating_sub(dialog_height) / 2;
-
-                Rect::new(dialog_x, dialog_y, dialog_width, dialog_height)
-            }
-
-            match dialog {
-                Dialog::ConfirmCancelJob(id) => {
-                    let dialog = Paragraph::new(Line::from(vec![
-                        Span::raw("Cancel job "),
-                        Span::styled(id, Style::default().add_modifier(Modifier::BOLD)),
-                        Span::raw("?"),
-                    ]))
-                    .style(Style::default().fg(Color::White))
-                    .wrap(Wrap { trim: true })
-                    .block(
-                        Block::default()
-                            .title("─Cancel")
-                            .borders(Borders::ALL)
-                            .border_type(BorderType::Rounded)
-                            .style(Style::default().fg(Color::Green)),
-                    );
-
-                    let area = centered_dialog_area(DIALOG_WIDTH, 3, f.area());
-                    f.render_widget(Clear, area);
-                    f.render_widget(dialog, area);
-                }
-                Dialog::SelectCancelSignal {
-                    id,
-                    selected_signal,
-                } => {
-                    let mut rows = vec![
-                        Line::from(vec![
-                            Span::raw("Send signal to job "),
-                            Span::styled(id, Style::default().add_modifier(Modifier::BOLD)),
-                            Span::raw(":"),
-                        ]),
-                        Line::default(),
-                    ];
-                    rows.extend(SCANCEL_SIGNALS.iter().enumerate().map(|(i, signal)| {
-                        let signal_style = if i == *selected_signal {
-                            Style::default().fg(Color::Black).bg(Color::Green)
-                        } else {
-                            Style::default()
-                        };
-                        let shortcut_style = signal_style.add_modifier(Modifier::DIM);
-                        Line::from(vec![
-                            Span::styled(format!("{}. ", i + 1), shortcut_style),
-                            Span::styled(*signal, signal_style),
-                        ])
-                    }));
-
-                    let dialog = Paragraph::new(Text::from(rows))
-                        .style(Style::default().fg(Color::White))
-                        .wrap(Wrap { trim: true })
-                        .block(
-                            Block::default()
-                                .title("─Signal")
-                                .borders(Borders::ALL)
-                                .border_type(BorderType::Rounded)
-                                .style(Style::default().fg(Color::Green)),
-                        );
-
-                    let area = centered_dialog_area(
-                        DIALOG_WIDTH,
-                        SCANCEL_SIGNALS.len() as u16 + 4,
-                        f.area(),
-                    );
-                    f.render_widget(Clear, area);
-                    f.render_widget(dialog, area);
-                }
-                Dialog::EditTimeLimit { id, input } => {
-                    let block = Block::default()
-                        .title("─Time Limit")
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .style(Style::default().fg(Color::Green));
-
-                    let area = centered_dialog_area(DIALOG_WIDTH, 3, f.area());
-                    let inner = block.inner(area);
-                    let prompt_prefix = "Set time limit for job ";
-                    let prompt_suffix = ": ";
-                    let prompt_width = (prompt_prefix.chars().count()
-                        + id.chars().count()
-                        + prompt_suffix.chars().count())
-                        as u16;
-                    let available_width = inner.width.saturating_sub(prompt_width).max(1) as usize;
-                    let scroll = input.visual_scroll(available_width);
-                    let visible_value = input
-                        .value()
-                        .chars()
-                        .skip(scroll)
-                        .take(available_width)
-                        .collect::<String>();
-                    let dialog = Paragraph::new(Line::from(vec![
-                        Span::raw(prompt_prefix),
-                        Span::styled(id, Style::default().add_modifier(Modifier::BOLD)),
-                        Span::raw(prompt_suffix),
-                        Span::styled(visible_value, Style::default().fg(Color::Blue)),
-                    ]))
-                    .style(Style::default().fg(Color::White))
-                    .block(block);
-
-                    f.render_widget(Clear, area);
-                    f.render_widget(dialog, area);
-
-                    let cursor_offset = input.visual_cursor().saturating_sub(scroll) as u16;
-                    let cursor_x = inner
-                        .x
-                        .saturating_add(prompt_width)
-                        .saturating_add(cursor_offset)
-                        .min(inner.x.saturating_add(inner.width.saturating_sub(1)));
-                    let cursor_y = inner.y;
-                    f.set_cursor_position((cursor_x, cursor_y));
-                }
-                Dialog::CommandError { command, output } => {
-                    let dialog_text = format!("Command: {command}\n\n{output}");
-                    let lines = dialog_text
-                        .lines()
-                        .count()
-                        .saturating_add(2)
-                        .min(u16::MAX as usize) as u16;
-                    let dialog = Paragraph::new(dialog_text)
-                        .style(Style::default().fg(Color::White))
-                        .wrap(Wrap { trim: false })
-                        .block(
-                            Block::default()
-                                .title("─Command Error")
-                                .borders(Borders::ALL)
-                                .border_type(BorderType::Rounded)
-                                .style(Style::default().fg(Color::Red)),
-                        );
-
-                    let area = centered_dialog_area(DIALOG_WIDTH, lines, f.area());
-                    f.render_widget(Clear, area);
-                    f.render_widget(dialog, area);
-                }
-            }
+            render_dialog(f, dialog);
         }
-    }
-}
-
-fn chunked_string(s: &str, first_chunk_size: usize, chunk_size: usize) -> Vec<&str> {
-    let stepped_indices = s
-        .char_indices()
-        .map(|(i, _)| i)
-        .enumerate()
-        .filter(|&(i, _)| {
-            if i > (first_chunk_size) {
-                chunk_size > 0 && (i - first_chunk_size).is_multiple_of(chunk_size)
-            } else {
-                i == 0 || i == first_chunk_size
-            }
-        })
-        .map(|(_, e)| e)
-        .collect::<Vec<_>>();
-    let windows = stepped_indices.windows(2).collect::<Vec<_>>();
-
-    let iter = windows.iter().map(|w| &s[w[0]..w[1]]);
-    let last_index = *stepped_indices.last().unwrap_or(&0);
-    iter.chain(once(&s[last_index..])).collect()
-}
-
-fn fit_text(
-    s: &'_ str,
-    lines: usize,
-    cols: usize,
-    anchor: ScrollAnchor,
-    offset: usize,
-    wrap: bool,
-) -> Text<'_> {
-    let s = s.rsplit_once(['\r', '\n']).map_or(s, |(p, _)| p); // skip everything after last line delimiter
-    let l = s.lines().flat_map(|l| l.split('\r')); // bandaid for term escape codes
-    let iter = match anchor {
-        ScrollAnchor::Top => Either::Left(l),
-        ScrollAnchor::Bottom => Either::Right(l.rev()),
-    };
-    let iter = iter
-        .skip(offset)
-        .flat_map(|l| {
-            let iter = if wrap {
-                Either::Left(
-                    chunked_string(l, cols, cols.saturating_sub(2))
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, l)| {
-                            if i == 0 {
-                                Line::raw(l.chars().take(cols).collect::<String>())
-                            } else {
-                                Line::default().spans(vec![
-                                    Span::styled(
-                                        "↪ ",
-                                        Style::default().add_modifier(Modifier::DIM),
-                                    ),
-                                    Span::raw(
-                                        l.chars().take(cols.saturating_sub(2)).collect::<String>(),
-                                    ),
-                                ])
-                            }
-                        }),
-                )
-            } else {
-                match l.chars().nth(cols) {
-                    Some(_) => {
-                        // has more chars than cols
-                        Either::Right(once(Line::default().spans(vec![
-                            Span::raw(l.chars().take(cols.saturating_sub(1)).collect::<String>()),
-                            Span::styled("…", Style::default().add_modifier(Modifier::DIM)),
-                        ])))
-                    }
-                    None => {
-                        Either::Right(once(Line::raw(l.chars().take(cols).collect::<String>())))
-                    }
-                }
-            };
-            match anchor {
-                ScrollAnchor::Top => Either::Left(iter),
-                ScrollAnchor::Bottom => Either::Right(iter.rev()),
-            }
-        })
-        .take(lines);
-
-    match anchor {
-        ScrollAnchor::Top => Text::from(iter.collect::<Vec<_>>()),
-        ScrollAnchor::Bottom => Text::from(
-            iter.collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>(),
-        ),
     }
 }
 
@@ -1107,146 +865,5 @@ fn mouse_wheel_direction(kind: MouseEventKind) -> Option<MouseWheelDirection> {
         MouseEventKind::ScrollUp => Some(MouseWheelDirection::Up),
         MouseEventKind::ScrollDown => Some(MouseWheelDirection::Down),
         _ => None,
-    }
-}
-
-fn signal_index_for_digit(digit: char) -> Option<usize> {
-    let value = digit.to_digit(10)? as usize;
-    if value == 0 { None } else { Some(value - 1) }
-}
-
-fn validated_time_limit(input: &Input) -> Option<String> {
-    let time_limit = input.value().trim();
-    if time_limit.is_empty() {
-        None
-    } else {
-        Some(time_limit.to_string())
-    }
-}
-
-fn execute_scancel(job_id: &str, signal: Option<&str>) -> Result<(), CommandFailure> {
-    let mut command = Command::new("scancel");
-    let mut command_display = String::from("scancel");
-
-    if let Some(signal) = signal {
-        command.arg("--signal").arg(signal);
-        command_display.push_str(&format!(" --signal {signal}"));
-    }
-    command.arg(job_id);
-    command_display.push_str(&format!(" {job_id}"));
-
-    execute_command(command, command_display)
-}
-
-fn execute_scontrol_update_timelimit(job_id: &str, time_limit: &str) -> Result<(), CommandFailure> {
-    let mut command = Command::new("scontrol");
-    command
-        .arg("update")
-        .arg(format!("JobId={job_id}"))
-        .arg(format!("TimeLimit={time_limit}"));
-
-    execute_command(
-        command,
-        format!("scontrol update JobId={job_id} TimeLimit={time_limit}"),
-    )
-}
-
-fn execute_command(mut command: Command, command_label: String) -> Result<(), CommandFailure> {
-    let output = command.output().map_err(|error| CommandFailure {
-        command: command_label.clone(),
-        output: error.to_string(),
-    })?;
-
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let mut details = vec![match output.status.code() {
-        Some(code) => format!("Exit code: {code}"),
-        None => "Exit code: N/A".to_string(),
-    }];
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stdout = stdout.trim_end();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stderr = stderr.trim_end();
-    let has_stdout = !stdout.is_empty();
-    let has_stderr = !stderr.is_empty();
-    match (has_stdout, has_stderr) {
-        (true, true) => {
-            details.push(format!("stdout:\n{stdout}"));
-            details.push(format!("stderr:\n{stderr}"));
-        }
-        (true, false) => {
-            details.push(stdout.to_string());
-        }
-        (false, true) => {
-            details.push(stderr.to_string());
-        }
-        (false, false) => {}
-    }
-
-    if details.len() == 1 {
-        details.push("No output.".to_string());
-    }
-
-    Err(CommandFailure {
-        command: command_label,
-        output: details.join("\n\n"),
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_chunked_string() {
-        // Divisible
-        let input = "abcdefghij";
-        let expected = vec!["abcd", "ef", "gh", "ij"];
-        assert_eq!(chunked_string(input, 4, 2), expected);
-
-        // Not divisible
-        let input = "123456789";
-        let expected = vec!["1234", "56", "78", "9"];
-        assert_eq!(chunked_string(input, 4, 2), expected);
-
-        // Smaller
-        let input = "abc";
-        let expected = vec!["abc"];
-        assert_eq!(chunked_string(input, 4, 2), expected);
-
-        // Smaller
-        let input = "abcde";
-        let expected = vec!["abcd", "e"];
-        assert_eq!(chunked_string(input, 4, 2), expected);
-
-        // Empty
-        let input = "";
-        let expected: Vec<&str> = vec![""];
-        assert_eq!(chunked_string(input, 4, 2), expected);
-
-        let input = "123456789";
-        let expected = vec!["1234", "56789"];
-        assert_eq!(chunked_string(input, 4, 0), expected);
-
-        let input = "123456789";
-        let expected = vec!["12", "34", "56", "78", "9"];
-        assert_eq!(chunked_string(input, 0, 2), expected);
-
-        let input = "123456789";
-        let expected = vec!["123456789"];
-        assert_eq!(chunked_string(input, 0, 0), expected);
-    }
-
-    #[test]
-    fn test_validated_time_limit() {
-        assert_eq!(validated_time_limit(&Input::new("".to_string())), None);
-        assert_eq!(validated_time_limit(&Input::new("   ".to_string())), None);
-        assert_eq!(
-            validated_time_limit(&Input::new(" 01:00:00 ".to_string())),
-            Some("01:00:00".to_string())
-        );
     }
 }

@@ -1,7 +1,10 @@
 mod app;
+mod dialog;
 mod file_watcher;
 mod job_watcher;
+mod slurm;
 mod squeue_args;
+mod ui_text;
 
 use app::App;
 use clap::CommandFactory;
